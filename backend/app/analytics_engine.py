@@ -46,6 +46,50 @@ def compute_metric(values: list[float | int], aggregator: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# 共享的度量分组输入整理
+# ---------------------------------------------------------------------------
+
+# 缺值计入策略：同批事实供立方与下钻处理时，各自保留自己的口径
+MISSING_SKIP = "skip"            # 缺值（缺失键/None）不进入聚合输入（多维立方口径）
+MISSING_ZERO_FILL = "zero_fill"  # 缺失键按合法零值 0.0 计入（下钻口径）
+
+
+def organize_measure_inputs(
+    rows: list[dict[str, Any]],
+    key_dimensions: list[str],
+    measure_names: list[str],
+    missing_policy: str = MISSING_SKIP,
+) -> dict[tuple[str, ...], dict[str, list[float]]]:
+    """把同批事实整理成「维度键 → 度量值列表」的分组聚合输入。
+
+    立方与下钻共用这一遍输入整理，各自的缺值计入口径由 missing_policy 保留：
+    - skip：缺失键与 None 不进入值列表；
+    - zero_fill：缺失键按合法零值 0.0 计入，显式 None 与不可解析值仍跳过。
+    两种策略都把事实里的 0 当作合法值保留，不可解析值一律跳过。
+    """
+    if missing_policy not in (MISSING_SKIP, MISSING_ZERO_FILL):
+        raise ValueError(f"不支持的缺值计入策略：{missing_policy}")
+    group_map: dict[tuple[str, ...], dict[str, list[float]]] = {}
+    for row in rows:
+        dim_key = tuple(str(row.get(d, "")) for d in key_dimensions)
+        if dim_key not in group_map:
+            group_map[dim_key] = {name: [] for name in measure_names}
+        buckets = group_map[dim_key]
+        for name in measure_names:
+            if missing_policy == MISSING_ZERO_FILL:
+                raw = row.get(name, 0)
+            else:
+                raw = row.get(name)
+                if raw is None:
+                    continue
+            try:
+                buckets[name].append(float(raw))
+            except (ValueError, TypeError):
+                pass
+    return group_map
+
+
+# ---------------------------------------------------------------------------
 # 多维立方预计算
 # ---------------------------------------------------------------------------
 
@@ -63,18 +107,9 @@ def build_cube_cell(
     measures: list[dict[str, str]],  # [{"name": "revenue", "aggregator": "SUM"}, ...]
 ) -> list[DimensionCombo]:
     """从原始数据构建多维立方单元格，按维度组合分组聚合度量。"""
-    group_map: dict[tuple[str, ...], dict[str, list[float | int]]] = {}
-    for row in raw_data:
-        dim_key = tuple(str(row.get(d, "")) for d in dimensions)
-        if dim_key not in group_map:
-            group_map[dim_key] = {m["name"]: [] for m in measures}
-        for m in measures:
-            val = row.get(m["name"])
-            if val is not None:
-                try:
-                    group_map[dim_key][m["name"]].append(float(val))
-                except (ValueError, TypeError):
-                    pass
+    group_map = organize_measure_inputs(
+        raw_data, dimensions, [m["name"] for m in measures], MISSING_SKIP,
+    )
 
     results: list[DimensionCombo] = []
     for dim_key, measure_data in group_map.items():
@@ -676,29 +711,201 @@ def compute_drill_levels(
     """按层级分组计算各层度量值。"""
     results: list[dict[str, Any]] = []
     for level_idx, dim in enumerate(drill_hierarchy):
-        group_map: dict[str, dict[str, list[float]]] = {}
-        for row in data:
-            key = str(row.get(dim, ""))
-            if key not in group_map:
-                group_map[key] = {m: [] for m in measures}
-            for m in measures:
-                try:
-                    group_map[key][m].append(float(row.get(m, 0)))
-                except (ValueError, TypeError):
-                    pass
+        group_map = organize_measure_inputs(data, [dim], measures, MISSING_ZERO_FILL)
         level_data: dict[str, Any] = {
             "level": level_idx,
             "dimension": dim,
             "groups": [],
         }
-        for key, mdata in group_map.items():
-            entry = {"key": key}
+        for dim_key, mdata in group_map.items():
+            entry = {"key": dim_key[0]}
             for m in measures:
                 values = mdata.get(m, [])
                 entry[m] = round(compute_metric(values, aggregator), 2)
             level_data["groups"].append(entry)
         results.append(level_data)
     return results
+
+
+# ---------------------------------------------------------------------------
+# 分片计算协调（同一分片供立方与下钻两个消费方）
+# ---------------------------------------------------------------------------
+
+# 分片阶段状态
+SHARD_COMPUTING = "computing"        # 消费方正在计算，阶段产物未足量
+SHARD_COMMITTED = "committed"        # 阶段产物已提交并积进总量
+SHARD_INTERRUPTED = "interrupted"    # 计算/写入被中断，等待重试
+SHARD_UNSTARTED = "unstarted"        # 该消费方尚未开始
+
+
+@dataclass
+class ShardStage:
+    """一个消费方在一个分片上的阶段产物。"""
+    shard_id: str
+    consumer: str
+    state: str = SHARD_COMPUTING
+    fact_count: int = 0
+    product: Any = None
+    attempts: int = 0
+
+    @property
+    def ready(self) -> bool:
+        """只有已提交的阶段产物才是足量产物。"""
+        return self.state == SHARD_COMMITTED
+
+
+class ShardCoordinator:
+    """协调同一批事实分片在多个计算消费方（立方/下钻）之间的提交与恢复。
+
+    - 每个消费方对同一分片独立 begin/commit，互不阻塞；
+    - 任何一方都能读到对方的阶段状态，未提交的一律可辨别为未足量；
+    - 提交幂等：中断重试后，同一分片在同一消费方只积进总量一次。
+    """
+
+    def __init__(self) -> None:
+        self._facts: dict[str, list[dict[str, Any]]] = {}
+        self._stages: dict[str, dict[str, ShardStage]] = defaultdict(dict)
+        self._committed_facts: dict[str, int] = defaultdict(int)
+
+    # -- 分片登记 -----------------------------------------------------------
+
+    def register_shard(self, shard_id: str, facts: list[dict[str, Any]]) -> dict[str, Any]:
+        """登记分片事实；同一分片重复登记同批事实时幂等，事实量冲突则拒绝。"""
+        existing = self._facts.get(shard_id)
+        if existing is not None:
+            if len(existing) != len(facts):
+                return {
+                    "ok": False,
+                    "message": f"分片 {shard_id} 已登记 {len(existing)} 条事实，与本次 {len(facts)} 条不一致",
+                }
+            return {"ok": True, "shard_id": shard_id, "fact_count": len(existing), "already_registered": True}
+        self._facts[shard_id] = list(facts)
+        return {"ok": True, "shard_id": shard_id, "fact_count": len(facts), "already_registered": False}
+
+    # -- 阶段生命周期 -------------------------------------------------------
+
+    def begin(self, consumer: str, shard_id: str) -> dict[str, Any]:
+        """消费方开始计算分片；已提交的分片重试时保持已提交状态（幂等）。"""
+        if shard_id not in self._facts:
+            return {"ok": False, "message": f"分片 {shard_id} 未登记"}
+        stage = self._stages[shard_id].get(consumer)
+        if stage is None:
+            stage = ShardStage(
+                shard_id=shard_id, consumer=consumer,
+                fact_count=len(self._facts[shard_id]),
+            )
+            self._stages[shard_id][consumer] = stage
+        if stage.state == SHARD_COMMITTED:
+            return {
+                "ok": True, "shard_id": shard_id, "consumer": consumer,
+                "state": stage.state, "already_committed": True, "attempts": stage.attempts,
+            }
+        stage.state = SHARD_COMPUTING
+        stage.product = None  # 新一次尝试从干净的产物开始
+        stage.attempts += 1
+        return {
+            "ok": True, "shard_id": shard_id, "consumer": consumer,
+            "state": stage.state, "already_committed": False, "attempts": stage.attempts,
+        }
+
+    def stage_product(self, consumer: str, shard_id: str, product: Any) -> dict[str, Any]:
+        """把算好的阶段产物挂到分片上；未提交前仍是未足量产物。"""
+        stage = self._stages.get(shard_id, {}).get(consumer)
+        if stage is None:
+            return {"ok": False, "message": f"消费方 {consumer} 尚未在分片 {shard_id} 上开始计算"}
+        if stage.state != SHARD_COMPUTING:
+            return {"ok": False, "message": f"分片 {shard_id} 当前状态 {stage.state}，不能暂存产物"}
+        stage.product = product
+        return {
+            "ok": True, "shard_id": shard_id, "consumer": consumer,
+            "state": stage.state, "staged": True,
+        }
+
+    def commit(self, consumer: str, shard_id: str, product: Any = None) -> dict[str, Any]:
+        """提交阶段产物并积进总量；重复提交幂等，只积进一次。"""
+        stage = self._stages.get(shard_id, {}).get(consumer)
+        if stage is None:
+            return {"ok": False, "message": f"消费方 {consumer} 尚未在分片 {shard_id} 上开始计算"}
+        if stage.state == SHARD_COMMITTED:
+            return {
+                "ok": True, "shard_id": shard_id, "consumer": consumer,
+                "state": stage.state, "already_committed": True, "accumulated": False,
+                "committed_facts": self._committed_facts[consumer],
+            }
+        if product is not None:
+            stage.product = product
+        stage.state = SHARD_COMMITTED
+        self._committed_facts[consumer] += stage.fact_count
+        return {
+            "ok": True, "shard_id": shard_id, "consumer": consumer,
+            "state": stage.state, "already_committed": False, "accumulated": True,
+            "fact_count": stage.fact_count,
+            "committed_facts": self._committed_facts[consumer],
+        }
+
+    def interrupt(self, consumer: str, shard_id: str) -> dict[str, Any]:
+        """中断当前计算/写入；未足量产物保留供辨别，已提交的不受影响。"""
+        stage = self._stages.get(shard_id, {}).get(consumer)
+        if stage is None:
+            return {"ok": False, "message": f"消费方 {consumer} 尚未在分片 {shard_id} 上开始计算"}
+        if stage.state != SHARD_COMMITTED:
+            stage.state = SHARD_INTERRUPTED
+        return {
+            "ok": True, "shard_id": shard_id, "consumer": consumer,
+            "state": stage.state,
+        }
+
+    # -- 读取与进度 -----------------------------------------------------------
+
+    def read(self, consumer: str, shard_id: str) -> dict[str, Any]:
+        """消费方读取分片：同批事实、自身产物（含未足量）与其他消费方进度。"""
+        if shard_id not in self._facts:
+            return {"ok": False, "message": f"分片 {shard_id} 未登记"}
+        stages = self._stages.get(shard_id, {})
+        stage = stages.get(consumer)
+        peers = {
+            other: {"state": s.state, "ready": s.ready}
+            for other, s in stages.items() if other != consumer
+        }
+        return {
+            "ok": True,
+            "shard_id": shard_id,
+            "consumer": consumer,
+            "state": stage.state if stage else SHARD_UNSTARTED,
+            "ready": bool(stage and stage.ready),
+            "product": stage.product if stage else None,
+            "peers": peers,
+            "fact_count": len(self._facts[shard_id]),
+            "facts": list(self._facts[shard_id]),
+        }
+
+    def progress(self, consumer: str) -> dict[str, Any]:
+        """消费方的总量进度：已积进事实数、未足量与中断的分片辨别。"""
+        committed_shards: list[str] = []
+        pending_shards: list[str] = []
+        interrupted_shards: list[str] = []
+        for shard_id in self._facts:
+            stage = self._stages.get(shard_id, {}).get(consumer)
+            if stage is not None and stage.state == SHARD_COMMITTED:
+                committed_shards.append(shard_id)
+                continue
+            pending_shards.append(shard_id)
+            if stage is not None and stage.state == SHARD_INTERRUPTED:
+                interrupted_shards.append(shard_id)
+        return {
+            "ok": True,
+            "consumer": consumer,
+            "expected_facts": sum(len(facts) for facts in self._facts.values()),
+            "committed_facts": self._committed_facts[consumer],
+            "complete": not pending_shards,
+            "committed_shards": sorted(committed_shards),
+            "pending_shards": sorted(pending_shards),
+            "interrupted_shards": sorted(interrupted_shards),
+        }
+
+
+# 立方与下钻共用的分片协调器
+shard_coordinator = ShardCoordinator()
 
 
 # ---------------------------------------------------------------------------
